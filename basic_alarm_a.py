@@ -23,11 +23,19 @@ SOFTWARE.
 """
 
 import sys
-import os.path
 import time
-import logging
+import json
 from cbcommslib import CbApp
 from cbconfig import *
+
+# Default values:
+config = {
+    "sensors": [],
+    "cid": "none",
+    "client_test": "False"
+}
+ENFILE     = CB_CONFIG_DIR + "basic_alarm.state"
+CONFIGfILE = CB_CONFIG_DIR + "basic_alarm.config"
 
 class Client():
     def __init__(self, aid):
@@ -38,7 +46,7 @@ class Client():
     def send(self, data):
         message = {
                    "source": self.aid,
-                   "destination": "CID71",
+                   "destination": config["cid"],
                    "body": data
                   }
         message["body"]["n"] = self.count
@@ -58,13 +66,41 @@ class Client():
         else:
             self.cbLog("warning", "Received message from client with no body")
 
+class EnableState():
+    def __init__(self):
+        pass
+        
+    def isEnabled(self):
+        try:
+            with open(ENFILE, 'r') as f:
+                self.val = int(f.read())
+            if self.val == 1:
+                return True
+            else:
+                return False
+        except Exception as ex:
+            self.cbLog("warning", "Could not read enable state from file")
+            self.cbLog("warning", "Exception: " + str(type(ex)) + str(ex.args))
+            return False
+
+    def enable(self, en):
+        if en:
+            val = 1
+        else:
+            val = 0
+        try:
+            with open(ENFILE, 'w') as f:
+                f.write(str(val))
+        except Exception as ex:
+            self.cbLog("warning", "Could not write enable state to file")
+            self.cbLog("warning", "Exception: " + str(type(ex)) + str(ex.args))
+
 class App(CbApp):
     def __init__(self, argv):
         self.appClass = "control"
         self.state = "stopped"
-        self.alarmOn = False
         self.sensorsID = [] 
-        self.switchID = ""
+        self.onSensors = []
         self.devices = []
         self.idToName = {} 
         # Super-class init must be called
@@ -76,6 +112,24 @@ class App(CbApp):
                "status": "state",
                "state": self.state}
         self.sendManagerMessage(msg)
+
+    def setNames(self):
+        if config["sensors"] == []:
+            for d in self.idToName:
+                config["sensors"].append(d)
+        else:
+            for n in config["sensors"]:
+                found = False
+                for d in self.idToName:
+                    self.cbLog("debug", "setName. Matching n: " + n + " with d: " + d + " , idToName[d]: " + self.idToName[d])
+                    if n == self.idToName[d]:
+                        loc = config["sensors"].index(n) 
+                        config["sensors"][loc] = d
+                        found = True
+                        break
+                if not found:
+                    self.cbLog("info", "setNames. Sensor name does not exist: " + n)
+        self.cbLog("debug", "setNames. sensors: " + str(config["sensors"]))
 
     def onAdaptorService(self, message):
         sensor = False
@@ -128,30 +182,56 @@ class App(CbApp):
         self.setState("running")
 
     def onAdaptorData(self, message):
-        self.cbLog("debug", "onAdaptorData. message: " + str(message))
+        #self.cbLog("debug", "onAdaptorData. message: " + str(message))
         if message["id"] in self.sensorsID:
             if message["characteristic"] == "buttons":
                 if message["data"]["rightButton"] == 1:
-                    self.alarmOn = True
+                    self.enableState.enable(True)
                 elif message["data"]["leftButton"] == 1:
-                    self.alarmOn = False
+                    self.enableState.enable(False)
+                self.cbLog("debug", "onAdaptorData. alarm: " + str(self.enableState.isEnabled()))
             elif message["characteristic"] == "number_buttons":
                 for m in message["data"].keys():
                     if m == "1":
-                        self.alarmOn = True
+                        self.enableState.enable(True)
                     elif m == "3":
-                        self.alarmOn = False
+                        self.enableState.enable(False)
+                self.cbLog("debug", "onAdaptorData. alarm: " + str(self.enableState.isEnabled()))
             elif message["characteristic"] == "binary_sensor":
-                if self.alarmOn and message["data"] == "on":
-                    msg = {"m": "intruder",
-                           "t": time.time(),
-                           "s": self.idToName[message["id"]]
+                if self.enableState.isEnabled() and message["data"] == "on":
+                    if not message["id"] in self.onSensors:
+                        self.onSensors.append(message["id"])
+                        msg = {"m": "intruder",
+                               "t": time.time(),
+                               "s": self.idToName[message["id"]]
                           }
-                    self.client.send(msg)
+                        self.client.send(msg)
+                else:
+                    if message["id"] in self.onSensors:
+                        self.onSensors.remove(message["id"])
+                self.cbLog("debug", "onSensors: " + str(self.onSensors))
 
     def onConfigureMessage(self, managerConfig):
-        #logging.debug("%s onConfigureMessage, config: %s", ModuleName, config)
+        global config
+        try:
+            with open(CONFIGfILE, 'r') as f:
+                newConfig = json.load(f)
+                self.cbLog("debug", "Read sch_app.config")
+                config.update(newConfig)
+        except Exception as ex:
+            self.cbLog("warning", "basic_alarm.config does not exist or file is corrupt")
+            self.cbLog("warning", "Exception: " + str(type(ex)) + str(ex.args))
+        for c in config:
+            if c.lower in ("true", "t", "1"):
+                config[c] = True
+            elif c.lower in ("false", "f", "0"):
+                config[c] = False
+        self.cbLog("debug", "Config: " + str(config))
+        if config["cid"] == "none":
+            self.cbLog("warning", "No Client ID (CID) specified. App will not report intruders.")
         self.client = Client(self.id)
+        self.client.sendMessage = self.sendMessage
+        self.client.cbLog = self.cbLog
         for adaptor in managerConfig["adaptors"]:
             adtID = adaptor["id"]
             if adtID not in self.devices:
@@ -161,8 +241,9 @@ class App(CbApp):
                 self.cbLog("debug", "managerConfigure app. Adaptor id: " +  adtID + " name: " + name + " friendly_name: " + friendly_name)
                 self.idToName[adtID] = friendly_name.replace(" ", "_")
                 self.devices.append(adtID)
-        self.client.sendMessage = self.sendMessage
-        self.client.cbLog = self.cbLog
+        self.setNames()
+        self.enableState = EnableState() 
+        self.enableState.cbLog = self.cbLog
         self.setState("starting")
 
 if __name__ == '__main__':
