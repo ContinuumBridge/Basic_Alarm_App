@@ -1,0 +1,9 @@
+{
+    "exe": "basic_alarm.py", 
+    "description": "Basic intruder alarm", 
+    "url": "https://github.com/ContinuumBridge/basic_alarm_app/archive/v1.0.0.tar.gz", 
+    "app_resource": "/api/bridge/v1/app/55", 
+    "version": "1.0.0", 
+    "provider": "ContinuumBridge", 
+    "name": "Basic Alarm"
+}
