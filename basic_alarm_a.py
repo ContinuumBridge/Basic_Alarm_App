@@ -25,51 +25,28 @@ SOFTWARE.
 import sys
 import time
 import json
-from cbcommslib import CbApp
+from cbutils import nicetime
+from cbcommslib import CbApp, CbClient
 from cbconfig import *
+from twisted.internet import reactor
 
 # Default values:
 config = {
-    "sensors": [],
-    "cid": "none",
-    "client_test": "False"
+    "ignore_time": 120
 }
-ENFILE     = CB_CONFIG_DIR + "basic_alarm.state"
-CONFIGfILE = CB_CONFIG_DIR + "basic_alarm.config"
 
-class Client():
-    def __init__(self, aid):
-        self.aid = aid
-        self.count = 0
-        self.messages = []
-
-    def send(self, data):
-        message = {
-                   "source": self.aid,
-                   "destination": config["cid"],
-                   "body": data
-                  }
-        message["body"]["n"] = self.count
-        self.count += 1
-        self.messages.append(message)
-        self.sendMessage(message, "conc")
-
-    def receive(self, message):
-        self.cbLog("debug", "Message from client: " + str(message))
-        if "body" in message:
-            if "n" in message["body"]:
-                self.cbLog("debug", "Received ack from client: " + str(message["body"]["n"]))
-                for m in self.messages:
-                    if m["body"]["n"] == m:
-                        self.messages.remove(m)
-                        self.cbLog("debug", "Removed message " + str(m) + " from queue")
-        else:
-            self.cbLog("warning", "Received message from client with no body")
+ENFILE       = CB_CONFIG_DIR + "basic_alarm.state"
+CONFIG_FILE  = CB_CONFIG_DIR + "basic_alarm.config"
+CID          = "CID164"  # Client ID
 
 class EnableState():
     def __init__(self):
-        pass
+        self.switch_ids = []
         
+    def setSwitch(self, deviceID):
+        if deviceID not in self.switch_ids:
+            self.switch_ids.append(deviceID)
+
     def isEnabled(self):
         try:
             with open(ENFILE, 'r') as f:
@@ -94,6 +71,14 @@ class EnableState():
         except Exception as ex:
             self.cbLog("warning", "Could not write enable state to file")
             self.cbLog("warning", "Exception: " + str(type(ex)) + str(ex.args))
+        for s in self.switch_ids:
+            command = {"id": self.id,
+                       "request": "command"}
+            if en:
+                command["data"] = "on"
+            else:
+                command["data"] = "off"
+            self.sendMessage(command, s)
 
 class App(CbApp):
     def __init__(self, argv):
@@ -103,6 +88,8 @@ class App(CbApp):
         self.onSensors = []
         self.devices = []
         self.idToName = {} 
+        self.lastTrigger = 0
+        reactor.callLater(10, self.resetSensors)
         # Super-class init must be called
         CbApp.__init__(self, argv)
 
@@ -113,25 +100,65 @@ class App(CbApp):
                "state": self.state}
         self.sendManagerMessage(msg)
 
-    def setNames(self):
-        if config["sensors"] == []:
-            for d in self.idToName:
-                config["sensors"].append(d)
-        else:
-            for n in config["sensors"]:
-                found = False
-                for d in self.idToName:
-                    self.cbLog("debug", "setName. Matching n: " + n + " with d: " + d + " , idToName[d]: " + self.idToName[d])
-                    if n == self.idToName[d]:
-                        loc = config["sensors"].index(n) 
-                        config["sensors"][loc] = d
-                        found = True
-                        break
-                if not found:
-                    self.cbLog("info", "setNames. Sensor name does not exist: " + n)
-        self.cbLog("debug", "setNames. sensors: " + str(config["sensors"]))
+    def resetSensors(self):
+        if time.time() - self.lastTrigger > config["ignore_time"]:
+            self.onSensors = []
+        reactor.callLater(10, self.resetSensors)
+
+    def readLocalConfig(self):
+        global config
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                newConfig = json.load(f)
+                self.cbLog("debug", "Read local config")
+                config.update(newConfig)
+        except Exception as ex:
+            self.cbLog("warning", "Local config does not exist or file is corrupt. Exception: " + str(type(ex)) + str(ex.args))
+        self.cbLog("debug", "Config: " + str(json.dumps(config, indent=4)))
+
+    def onConcMessage(self, message):
+        #self.cbLog("debug", "onConcMessage, message: " + str(json.dumps(message, indent=4)))
+        if "status" in message:
+            if message["status"] == "ready":
+                # Do this after we have established communications with the concentrator
+                msg = {
+                    "m": "req_config",
+                    "d": self.id
+                }
+                self.client.send(msg)
+        self.client.receive(message)
+
+    def onClientMessage(self, message):
+        #self.cbLog("debug", "onClientMessage, message: " + str(json.dumps(message, indent=4)))
+        global config
+        if "config" in message:
+            if "warning" in message["config"]:
+                self.cbLog("warning", "onClientMessage: " + str(json.dumps(message["config"], indent=4)))
+            else:
+                try:
+                    newConfig = message["config"]
+                    copyConfig = config.copy()
+                    copyConfig.update(newConfig)
+                    if copyConfig != config or not os.path.isfile(CONFIG_FILE):
+                        self.cbLog("debug", "onClientMessage. Updating config from client message")
+                        config = copyConfig.copy()
+                        with open(CONFIG_FILE, 'w') as f:
+                            json.dump(config, f)
+                        #self.cbLog("info", "Config updated")
+                        self.readLocalConfig()
+                        # With a new config, send init message to all connected adaptors
+                        for i in self.adtInstances:
+                            init = {
+                                "id": self.id,
+                                "appClass": self.appClass,
+                                "request": "init"
+                            }
+                            self.sendMessage(init, i)
+                except Exception as ex:
+                    self.cbLog("warning", "onClientMessage, could not write to file. Type: " + str(type(ex)) + ", exception: " +  str(ex.args))
 
     def onAdaptorService(self, message):
+        #self.cbLog("debug", "onAdaptorService. message: " + str(message))
         sensor = False
         switch = False
         buttons = False
@@ -146,6 +173,8 @@ class App(CbApp):
                 switch = True
             if p["characteristic"] == "binary_sensor":
                 binary_sensor = True
+        if switch and binary_sensor:
+            binary_sensor = False  # Don't trigger on an indicator device
         if buttons:
             self.sensorsID.append(message["id"])
             req = {"id": self.id,
@@ -179,6 +208,8 @@ class App(CbApp):
                               ]
                   }
             self.sendMessage(req, message["id"])
+        if switch:
+            self.enableState.setSwitch(message["id"])
         self.setState("running")
 
     def onAdaptorData(self, message):
@@ -200,50 +231,39 @@ class App(CbApp):
             elif message["characteristic"] == "binary_sensor":
                 if self.enableState.isEnabled() and message["data"] == "on":
                     if not message["id"] in self.onSensors:
+                        now = time.time()
+                        self.lastTrigger = now
                         self.onSensors.append(message["id"])
-                        msg = {"m": "intruder",
-                               "t": time.time(),
-                               "s": self.idToName[message["id"]]
-                          }
+                        active = []
+                        for a in self.onSensors:
+                            active.append(self.idToName[a])
+                        msg = {"m": "alert",
+                               "a": "Intruder detected by " + str(", ".join(active)) + " at " + nicetime(now),
+                               "t": now
+                        }
                         self.client.send(msg)
-                else:
-                    if message["id"] in self.onSensors:
-                        self.onSensors.remove(message["id"])
-                self.cbLog("debug", "onSensors: " + str(self.onSensors))
+                #self.cbLog("debug", "onSensors: " + str(self.onSensors))
 
     def onConfigureMessage(self, managerConfig):
-        global config
-        try:
-            with open(CONFIGfILE, 'r') as f:
-                newConfig = json.load(f)
-                self.cbLog("debug", "Read sch_app.config")
-                config.update(newConfig)
-        except Exception as ex:
-            self.cbLog("warning", "basic_alarm.config does not exist or file is corrupt")
-            self.cbLog("warning", "Exception: " + str(type(ex)) + str(ex.args))
-        for c in config:
-            if c.lower in ("true", "t", "1"):
-                config[c] = True
-            elif c.lower in ("false", "f", "0"):
-                config[c] = False
-        self.cbLog("debug", "Config: " + str(config))
-        if config["cid"] == "none":
-            self.cbLog("warning", "No Client ID (CID) specified. App will not report intruders.")
-        self.client = Client(self.id)
-        self.client.sendMessage = self.sendMessage
-        self.client.cbLog = self.cbLog
         for adaptor in managerConfig["adaptors"]:
             adtID = adaptor["id"]
             if adtID not in self.devices:
                 # Because managerConfigure may be re-called if devices are added
                 name = adaptor["name"]
                 friendly_name = adaptor["friendly_name"]
-                self.cbLog("debug", "managerConfigure app. Adaptor id: " +  adtID + " name: " + name + " friendly_name: " + friendly_name)
+                #self.cbLog("debug", "managerConfigure app. Adaptor id: " +  adtID + " name: " + name + " friendly_name: " + friendly_name)
                 self.idToName[adtID] = friendly_name.replace(" ", "_")
                 self.devices.append(adtID)
-        self.setNames()
+        self.readLocalConfig()
         self.enableState = EnableState() 
         self.enableState.cbLog = self.cbLog
+        self.enableState.id = self.id
+        self.enableState.sendMessage = self.sendMessage
+        self.client = CbClient(self.id, CID, 5)
+        self.client.onClientMessage = self.onClientMessage
+        self.client.sendMessage = self.sendMessage
+        self.client.cbLog = self.cbLog
+        self.client.loadSaved()
         self.setState("starting")
 
 if __name__ == '__main__':
